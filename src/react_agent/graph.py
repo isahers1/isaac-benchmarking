@@ -1,115 +1,125 @@
-"""Define a custom Reasoning and Action agent.
+from __future__ import annotations
 
-Works with a chat model with tool calling support.
-"""
+import asyncio
+from dataclasses import dataclass, field
+from enum import Enum
+from operator import add
+from typing import Annotated, Any, Literal
 
-from datetime import UTC, datetime
-from typing import Dict, List, Literal, cast
-
-from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
-from langgraph.prebuilt import ToolNode
-
-from react_agent.configuration import Configuration
-from react_agent.state import InputState, State
-from react_agent.tools import TOOLS
-from react_agent.utils import load_chat_model
-
-# Define the function that calls the model
+from langgraph.types import Send
+from typing_extensions import TypedDict
 
 
-async def call_model(state: State) -> Dict[str, List[AIMessage]]:
-    """Call the LLM powering our "agent".
+class Configuration(TypedDict):
+    delay: int
 
-    This function prepares the prompt, initializes the model, and processes the response.
 
-    Args:
-        state (State): The current state of the conversation.
-        config (RunnableConfig): Configuration for the model run.
-
-    Returns:
-        dict: A dictionary containing the model's response message.
+class BenchmarkMode(Enum):
     """
-    configuration = Configuration.from_context()
+    Benchmarking scenarios to consider:
+    - Single node
+    - Multi-node, sequential
+    - Multi-node, high concurrency parallel
+    """
 
-    # Initialize the model with tool binding. Change the model or add more tools here.
-    model = load_chat_model(configuration.model).bind_tools(TOOLS)
+    SINGLE_NODE = "single"
+    SEQUENTIAL_NODES = "sequential"
+    PARALLEL_NODES = "parallel"
 
-    # Format the system prompt. Customize this to change the agent's behavior.
-    system_message = configuration.system_prompt.format(
-        system_time=datetime.now(tz=UTC).isoformat()
-    )
 
-    # Get the model's response
-    response = cast(
-        AIMessage,
-        await model.ainvoke(
-            [{"role": "system", "content": system_message}, *state.messages]
-        ),
-    )
+class Message(TypedDict):
+    id: int
+    content: str
 
-    # Handle the case when it's the last step and the model still wants to use a tool
-    if state.is_last_step and response.tool_calls:
-        return {
-            "messages": [
-                AIMessage(
-                    id=response.id,
-                    content="Sorry, I could not find an answer to your question in the specified number of steps.",
-                )
+
+@dataclass
+class State:
+    """Input state for the agent.
+
+    Defines the initial structure of incoming data.
+    See: https://langchain-ai.github.io/langgraph/concepts/low_level/#state
+    """
+
+    counter: int = 0
+    delay: int = 0
+    data_size: int = 1000
+    expand: int = 50
+    mode: BenchmarkMode = BenchmarkMode.SINGLE_NODE
+    messages: Annotated[list[Message], add] = field(default_factory=list)
+
+
+def create_large_data(state: State) -> str:
+    return "a" * state.data_size
+
+
+async def entry_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    """
+    Entry node for the graph.
+
+    Convert the mode from string to BenchmarkMode enum.
+    """
+    return {
+        "counter": 0,
+        "mode": BenchmarkMode(state.mode) if state.mode else BenchmarkMode.SINGLE_NODE,
+        "messages": [{"id": 0, "content": "Hello from entry node!"}],
+    }
+
+
+async def sequential_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    state.counter += 1
+    await asyncio.sleep(state.delay)
+    return {
+        "counter": state.counter,
+        "messages": [
+            {
+                "id": state.counter,
+                "content": f"Hello from sequential node {state.counter}! Data: {create_large_data(state)}",
+            }
+        ],
+    }
+
+
+async def parallel_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    await asyncio.sleep(state.delay)
+    return {
+        "messages": [
+            {
+                "id": state["parallel_id"],
+                "content": f"Hello from parallel node {state['parallel_id']}! Data: {create_large_data(state)}",
+            }
+        ]
+    }
+
+
+def should_continue(
+    state: State, config: RunnableConfig
+) -> Literal["__end__", "sequential_node"]:
+    match state.mode:
+        case BenchmarkMode.SINGLE_NODE:
+            return "__end__"
+        case BenchmarkMode.SEQUENTIAL_NODES:
+            if state.counter < state.expand:
+                return "sequential_node"
+            else:
+                return "__end__"
+        case BenchmarkMode.PARALLEL_NODES:
+            return [
+                Send("parallel_node", {"parallel_id": id})
+                for id in range(1, state.expand + 1)
             ]
-        }
-
-    # Return the model's response as a list to be added to existing messages
-    return {"messages": [response]}
 
 
-# Define a new graph
+builder = StateGraph(State, Configuration)
 
-builder = StateGraph(State, input=InputState, config_schema=Configuration)
-
-# Define the two nodes we will cycle between
-builder.add_node(call_model)
-builder.add_node("tools", ToolNode(TOOLS))
-
-# Set the entrypoint as `call_model`
-# This means that this node is the first one called
-builder.add_edge("__start__", "call_model")
-
-
-def route_model_output(state: State) -> Literal["__end__", "tools"]:
-    """Determine the next node based on the model's output.
-
-    This function checks if the model's last message contains tool calls.
-
-    Args:
-        state (State): The current state of the conversation.
-
-    Returns:
-        str: The name of the next node to call ("__end__" or "tools").
-    """
-    last_message = state.messages[-1]
-    if not isinstance(last_message, AIMessage):
-        raise ValueError(
-            f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
-        )
-    # If there is no tool call, then we finish
-    if not last_message.tool_calls:
-        return "__end__"
-    # Otherwise we execute the requested actions
-    return "tools"
-
-
-# Add a conditional edge to determine the next step after `call_model`
-builder.add_conditional_edges(
-    "call_model",
-    # After call_model finishes running, the next node(s) are scheduled
-    # based on the output from route_model_output
-    route_model_output,
+graph = (
+    builder.add_node(entry_node)
+    .add_node(sequential_node)
+    .add_node(parallel_node)
+    .add_edge("__start__", "entry_node")
+    .add_conditional_edges("entry_node", should_continue)
+    .add_conditional_edges("sequential_node", should_continue)
+    .add_edge("parallel_node", "__end__")
+    .compile(name="New Graph")
 )
-
-# Add a normal edge from `tools` to `call_model`
-# This creates a cycle: after using tools, we always return to the model
-builder.add_edge("tools", "call_model")
-
-# Compile the builder into an executable graph
-graph = builder.compile(name="ReAct Agent")
